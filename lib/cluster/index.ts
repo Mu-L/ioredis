@@ -190,6 +190,15 @@ class Cluster<
           '". Expected "all", "master", "slave" or a custom function'
       );
     }
+    if (
+      ["all", "master", "slave"].indexOf(this.options.subscriberNodeRole) === -1
+    ) {
+      throw new Error(
+        'Invalid option subscriberNodeRole "' +
+          this.options.subscriberNodeRole +
+          '". Expected "all", "master" or "slave"'
+      );
+    }
 
     const redisOptions = { ...(this.options.redisOptions ?? {}) };
     delete (redisOptions as Partial<RedisOptions>).himportFieldsets;
@@ -247,7 +256,11 @@ class Cluster<
       this.emit("node error", error, key);
     });
 
-    this.subscriber = new ClusterSubscriber(this.connectionPool, this);
+    this.subscriber = new ClusterSubscriber(
+      this.connectionPool,
+      this,
+      this.options.subscriberNodeRole
+    );
 
     if (this.options.scripts) {
       Object.entries(this.options.scripts).forEach(([name, definition]) => {
@@ -329,6 +342,15 @@ class Cluster<
             this.removeListener("close", closeListener);
             this.manuallyClosing = false;
             this.setStatus("connect");
+            // Startup nodes have no authoritative role metadata until the
+            // first slots refresh completes. Automatic reconnects recover an
+            // already-started subscriber while resetting the connection pool.
+            if (
+              this.options.subscriberNodeRole !== "all" &&
+              !this.subscriber.isStarted()
+            ) {
+              this.subscriber.start();
+            }
             if (this.options.enableReadyCheck) {
               this.readyCheck((err, fail) => {
                 if (err || fail) {
@@ -366,7 +388,9 @@ class Cluster<
               this.connectionPool.reset([]);
             }
           });
-          this.subscriber.start();
+          if (this.options.subscriberNodeRole === "all") {
+            this.subscriber.start();
+          }
 
           if (this.options.shardedSubscribers) {
             this.shardedSubscribers.start().catch((err) => {
@@ -765,6 +789,14 @@ class Cluster<
             }
           } else {
             redis = _this.subscriber.getInstance();
+            if (!redis && _this.options.subscriberNodeRole !== "all") {
+              command.reject(
+                new AbortError(
+                  `No node matching subscriberNodeRole "${_this.options.subscriberNodeRole}" is available for the cluster subscriber`
+                )
+              );
+              return;
+            }
           }
 
           if (!redis) {
@@ -1194,6 +1226,8 @@ class Cluster<
         }
 
         this.connectionPool.reset(nodes);
+        // A refresh can reclassify an existing node without emitting "+node".
+        this.subscriber.selectSubscriberIfNeeded();
 
         if (this.options.shardedSubscribers) {
           this.shardedSubscribers
